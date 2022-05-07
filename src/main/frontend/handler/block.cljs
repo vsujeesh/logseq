@@ -1,13 +1,20 @@
 (ns frontend.handler.block
-  (:require [clojure.set :as set]
+  (:require ["/frontend/utils" :as utils]
+            [clojure.set :as set]
+            [clojure.string :as string]
             [clojure.walk :as walk]
+            [dommy.core :as dom]
             [frontend.db :as db]
             [frontend.db.model :as db-model]
             [frontend.db.react :as react]
-            [frontend.state :as state]
             [frontend.format.block :as block]
-            [frontend.util :as util]))
-
+            [frontend.format.mldoc :as mldoc]
+            [frontend.state :as state]
+            [frontend.util :as util]
+            [goog.dom :as gdom]
+            [goog.dom.classes :as gdom-classes]
+            [goog.object :as gobj]
+            [frontend.handler.dnd :as dnd]))
 
 ;;  Fns
 
@@ -114,3 +121,116 @@
                             (fn [result]
                               (->> (concat result more-data)
                                    (util/distinct-by :db/id))))))
+
+;;;; Block drag event handler
+;;;;;; local state
+(defonce *dragging?
+  (atom false))
+(defonce *dragging-block
+  (atom nil))
+(defonce *drag-to-block
+  (atom nil))
+(def *move-to (atom nil))
+
+;;;;;; Helper functions
+(defn- dnd-same-block?
+  [uuid]
+  (= (:block/uuid @*dragging-block) uuid))
+
+(defn non-dragging?
+  [e]
+  (and (= (gobj/get e "buttons") 1)
+       (not (dom/has-class? (gobj/get e "target") "bullet-container"))
+       (not (dom/has-class? (gobj/get e "target") "bullet"))
+       (not @*dragging?)))
+
+(defn highlight-block!
+  [block-uuid]
+  (let [blocks (array-seq (js/document.getElementsByClassName (str block-uuid)))]
+    (doseq [block blocks]
+      (dom/add-class! block "block-highlight"))))
+
+(defn unhighlight-blocks!
+  []
+  (let [blocks (some->> (array-seq (js/document.getElementsByClassName "block-highlight"))
+                        (repeat 2)
+                        (apply concat))]
+    (doseq [block blocks]
+      (gdom-classes/remove block "block-highlight"))))
+
+;;;;;; Drag event Listeners
+(defn bullet-drag-start
+  [event block uuid block-id]
+  (highlight-block! uuid)
+  (.setData (gobj/get event "dataTransfer")
+            "block-uuid"
+            uuid)
+  (.setData (gobj/get event "dataTransfer")
+            "block-dom-id"
+            block-id)
+  (reset! *dragging? true)
+  (reset! *dragging-block block))
+
+(defn block-drag-start
+  [event block uuid block-id]
+  (bullet-drag-start event block uuid block-id))
+
+(defn block-drag-over
+  [event uuid top? block-id *move-to]
+  (util/stop event)
+  (when-not (dnd-same-block? uuid)
+    (let [over-block (gdom/getElement block-id)
+          rect (utils/getOffsetRect over-block)
+          element-top (gobj/get rect "top")
+          element-left (gobj/get rect "left")
+          x-offset (- (.. event -pageX) element-left)
+          cursor-top (gobj/get event "clientY")
+          move-to-value (cond
+                          (and top? (<= (js/Math.abs (- cursor-top element-top)) 16))
+                          :top
+
+                          (> x-offset 50)
+                          :nested
+
+                          :else
+                          :sibling)]
+      (reset! *drag-to-block block-id)
+      (reset! *move-to move-to-value))))
+
+(defn block-drag-leave
+  [*move-to]
+  (reset! *move-to nil))
+
+(defn block-drop
+  [event uuid target-block *move-to]
+  (util/stop event)
+  (when-not (dnd-same-block? uuid)
+    (let [block-uuids (state/get-selection-block-ids)
+          lookup-refs (map (fn [id] [:block/uuid id]) block-uuids)
+          selected (db/pull-many (state/get-current-repo) '[*] lookup-refs)
+          blocks (if (seq selected) selected [@*dragging-block])]
+      (dnd/move-blocks event blocks target-block @*move-to)))
+  (reset! *dragging? false)
+  (reset! *dragging-block nil)
+  (reset! *drag-to-block nil)
+  (reset! *move-to nil)
+  (unhighlight-blocks!))
+
+(defn block-drag-end
+  [_event *move-to]
+  (reset! *dragging? false)
+  (reset! *dragging-block nil)
+  (reset! *drag-to-block nil)
+  (reset! *move-to nil)
+  (unhighlight-blocks!))
+
+(defn on-drag-and-mouse-attrs
+  [block uuid top? block-id *move-to]
+  {:on-drag-over (fn [event]
+                   (block-drag-over event uuid top? block-id *move-to))
+   :on-drag-leave (fn [_event]
+                    (block-drag-leave *move-to))
+   :on-drop (fn [event]
+              (block-drop event uuid block *move-to))
+   :on-drag-end (fn [event]
+                  (block-drag-end event *move-to))})

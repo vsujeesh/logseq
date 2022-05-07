@@ -46,7 +46,6 @@
             [frontend.util.thingatpt :as thingatpt]
             [frontend.util.list :as list]
             [goog.dom :as gdom]
-            [goog.dom.classes :as gdom-classes]
             [goog.object :as gobj]
             [lambdaisland.glogi :as log]
             [medley.core :as medley]
@@ -179,20 +178,6 @@
                        (diff/find-position markup cursor-range)))]
       (cursor/move-cursor-to node pos)
       (state/clear-editor-last-pos!))))
-
-(defn highlight-block!
-  [block-uuid]
-  (let [blocks (array-seq (js/document.getElementsByClassName (str block-uuid)))]
-    (doseq [block blocks]
-      (dom/add-class! block "block-highlight"))))
-
-(defn unhighlight-blocks!
-  []
-  (let [blocks (some->> (array-seq (js/document.getElementsByClassName "block-highlight"))
-                        (repeat 2)
-                        (apply concat))]
-    (doseq [block blocks]
-      (gdom-classes/remove block "block-highlight"))))
 
 (defn- get-edit-input-id-with-block-id
   [block-id]

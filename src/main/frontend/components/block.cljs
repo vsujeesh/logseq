@@ -11,35 +11,36 @@
             [frontend.commands :as commands]
             [frontend.components.datetime :as datetime-comp]
             [frontend.components.lazy-editor :as lazy-editor]
-            [frontend.components.svg :as svg]
             [frontend.components.macro :as macro]
+            [frontend.components.plugins :as plugins]
+            [frontend.components.query-table :as query-table]
+            [frontend.components.svg :as svg]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
             [frontend.date :as date]
             [frontend.db :as db]
-            [frontend.db.utils :as db-utils]
             [frontend.db-mixins :as db-mixins]
             [frontend.db.model :as model]
             [frontend.db.query-dsl :as query-dsl]
+            [frontend.db.utils :as db-utils]
             [frontend.extensions.highlight :as highlight]
             [frontend.extensions.latex :as latex]
-            [frontend.extensions.sci :as sci]
-            [frontend.extensions.pdf.assets :as pdf-assets]
-            [frontend.extensions.zotero :as zotero]
             [frontend.extensions.lightbox :as lightbox]
+            [frontend.extensions.pdf.assets :as pdf-assets]
+            [frontend.extensions.sci :as sci]
             [frontend.extensions.video.youtube :as youtube]
+            [frontend.extensions.zotero :as zotero]
             [frontend.format.block :as block]
             [frontend.format.mldoc :as mldoc]
-            [frontend.components.plugins :as plugins]
-            [frontend.handler.plugin :as plugin-handler]
-            [frontend.handler.block :as block-handler]
-            [frontend.handler.dnd :as dnd]
+            [frontend.handler.block :as block-handler :refer [*move-to]]
+            [frontend.handler.common :as common-handler]
             [frontend.handler.editor :as editor-handler]
+            [frontend.handler.plugin :as plugin-handler]
+            [frontend.handler.query :as query-handler]
             [frontend.handler.repeated :as repeated]
             [frontend.handler.route :as route-handler]
             [frontend.handler.ui :as ui-handler]
-            [frontend.handler.query :as query-handler]
-            [frontend.handler.common :as common-handler]
+            [frontend.mobile.util :as mobile-util]
             [frontend.modules.outliner.tree :as tree]
             [frontend.search :as search]
             [frontend.security :as security]
@@ -49,8 +50,8 @@
             [frontend.ui :as ui]
             [frontend.util :as util]
             [frontend.util.clock :as clock]
-            [frontend.util.property :as property]
             [frontend.util.drawer :as drawer]
+            [frontend.util.property :as property]
             [goog.dom :as gdom]
             [goog.object :as gobj]
             [lambdaisland.glogi :as log]
@@ -58,9 +59,7 @@
             [promesa.core :as p]
             [reitit.frontend.easy :as rfe]
             [rum.core :as rum]
-            [shadow.loader :as loader]
-            [frontend.components.query-table :as query-table]
-            [frontend.mobile.util :as mobile-util]))
+            [shadow.loader :as loader]))
 
 (defn safe-read-string
   ([s]
@@ -73,15 +72,6 @@
        (when warn?
          [:div.warning {:title "read-string failed"}
           s])))))
-
-;; local state
-(defonce *dragging?
-  (atom false))
-(defonce *dragging-block
-  (atom nil))
-(defonce *drag-to-block
-  (atom nil))
-(def *move-to (atom nil))
 
 ;; TODO: dynamic
 (defonce max-depth-of-links 5)
@@ -1359,21 +1349,6 @@
   [block]
   block)
 
-(defn- dnd-same-block?
-  [uuid]
-  (= (:block/uuid @*dragging-block) uuid))
-
-(defn- bullet-drag-start
-  [event block uuid block-id]
-  (editor-handler/highlight-block! uuid)
-  (.setData (gobj/get event "dataTransfer")
-            "block-uuid"
-            uuid)
-  (.setData (gobj/get event "dataTransfer")
-            "block-dom-id"
-            block-id)
-  (reset! *dragging? true)
-  (reset! *dragging-block block))
 
 (defn- bullet-on-click
   [e block uuid]
@@ -1458,7 +1433,7 @@
                     {:id (str "dot-" uuid)
                      :draggable true
                      :on-drag-start (fn [event]
-                                      (bullet-drag-start event block uuid block-id))
+                                      (block-handler/bullet-drag-start event block uuid block-id))
                      :blockid (str uuid)
                      :class (str (when collapsed? "bullet-closed")
                                  " "
@@ -1808,7 +1783,7 @@
           (editor-handler/highlight-selection-area! block-id)
           (do
             (editor-handler/clear-selection!)
-            (editor-handler/unhighlight-blocks!)
+            (block-handler/unhighlight-blocks!)
             (let [f #(let [block (or (db/pull [:block/uuid (:block/uuid block)]) block)
                            cursor-range (util/caret-range (gdom/getElement block-id))
                            {:block/keys [content format]} block
@@ -1833,8 +1808,8 @@
 
 (rum/defc dnd-separator-wrapper < rum/reactive
   [block block-id slide? top? block-content?]
-  (let [dragging? (rum/react *dragging?)
-        drag-to-block (rum/react *drag-to-block)]
+  (let [dragging? (rum/react block-handler/*dragging?)
+        drag-to-block (rum/react block-handler/*drag-to-block)]
     (when (and
            (= block-id drag-to-block)
            dragging?
@@ -2009,12 +1984,7 @@
 
         (block-refs-count block)]])))
 
-(defn non-dragging?
-  [e]
-  (and (= (gobj/get e "buttons") 1)
-       (not (dom/has-class? (gobj/get e "target") "bullet-container"))
-       (not (dom/has-class? (gobj/get e "target") "bullet"))
-       (not @*dragging?)))
+
 
 (rum/defc breadcrumb-fragment
   [config block label]
@@ -2084,55 +2054,6 @@
                           " ml-4")))}
          breadcrumb]))))
 
-(defn- block-drag-over
-  [event uuid top? block-id *move-to]
-  (util/stop event)
-  (when-not (dnd-same-block? uuid)
-    (let [over-block (gdom/getElement block-id)
-          rect (utils/getOffsetRect over-block)
-          element-top (gobj/get rect "top")
-          element-left (gobj/get rect "left")
-          x-offset (- (.. event -pageX) element-left)
-          cursor-top (gobj/get event "clientY")
-          move-to-value (cond
-                          (and top? (<= (js/Math.abs (- cursor-top element-top)) 16))
-                          :top
-
-                          (> x-offset 50)
-                          :nested
-
-                          :else
-                          :sibling)]
-      (reset! *drag-to-block block-id)
-      (reset! *move-to move-to-value))))
-
-(defn- block-drag-leave
-  [*move-to]
-  (reset! *move-to nil))
-
-(defn- block-drop
-  [event uuid target-block *move-to]
-  (util/stop event)
-  (when-not (dnd-same-block? uuid)
-    (let [block-uuids (state/get-selection-block-ids)
-          lookup-refs (map (fn [id] [:block/uuid id]) block-uuids)
-          selected (db/pull-many (state/get-current-repo) '[*] lookup-refs)
-          blocks (if (seq selected) selected [@*dragging-block])]
-      (dnd/move-blocks event blocks target-block @*move-to)))
-  (reset! *dragging? false)
-  (reset! *dragging-block nil)
-  (reset! *drag-to-block nil)
-  (reset! *move-to nil)
-  (editor-handler/unhighlight-blocks!))
-
-(defn- block-drag-end
-  [_event *move-to]
-  (reset! *dragging? false)
-  (reset! *dragging-block nil)
-  (reset! *drag-to-block nil)
-  (reset! *move-to nil)
-  (editor-handler/unhighlight-blocks!))
-
 (defn- block-mouse-over
   [uuid e *control-show? block-id doc-mode?]
   (util/stop e)
@@ -2146,7 +2067,7 @@
         (dom/remove-class! node "hide-inner-bullet"))))
   (when (and
          (state/in-selection-mode?)
-         (non-dragging? e))
+         (block-handler/non-dragging? e))
     (util/stop e)
     (editor-handler/highlight-selection-area! block-id)))
 
@@ -2158,21 +2079,9 @@
     (when-let [parent (gdom/getElement block-id)]
       (when-let [node (.querySelector parent ".bullet-container")]
         (dom/add-class! node "hide-inner-bullet"))))
-  (when (and (non-dragging? e)
+  (when (and (block-handler/non-dragging? e)
              (not @*resizing-image?))
     (state/into-selection-mode!)))
-
-(defn- on-drag-and-mouse-attrs
-  [block uuid top? block-id *move-to]
-  {:on-drag-over (fn [event]
-                   (block-drag-over event uuid top? block-id *move-to))
-   :on-drag-leave (fn [_event]
-                    (block-drag-leave *move-to))
-   :on-drop (fn [event]
-              (block-drop event uuid block *move-to))
-   :on-drag-end (fn [event]
-                  (block-drag-end event *move-to))})
-
 (defn- build-refs-data-value
   [refs]
   (let [refs (model/get-page-names-by-ids
@@ -2256,7 +2165,7 @@
                      (not pre-block?)
                      (coll? children)
                      (seq children)))
-        attrs (on-drag-and-mouse-attrs block uuid top? block-id *move-to)
+        attrs (block-handler/on-drag-and-mouse-attrs block uuid top? block-id *move-to)
         children-refs (get-children-refs children)
         data-refs (build-refs-data-value children-refs)
         data-refs-self (build-refs-data-value refs)
@@ -2302,6 +2211,9 @@
 
      [:div.flex.flex-row.pr-2
       {:class (if (and heading? (seq (:block/title block))) "items-baseline" "")
+       :draggable true
+       :on-drag-start (fn [e]
+                        (block-handler/block-drag-start e block uuid block-id))
        :on-mouse-over (fn [e]
                         (block-mouse-over uuid e *control-show? block-id doc-mode?))
        :on-mouse-leave (fn [e]
